@@ -2,12 +2,17 @@
 
 上游：quality_rule 产出校验规则 → validation_run 执行校验批次
 消费：alert_policy 消费校验结果触发告警
+
+分区抽样增强：质量执行汇总不再只按收到的行数算坏行比例，
+而是读取分区抽样门禁的分层质量结果（加权坏行率、覆盖度、暂算/确认），
+并把坏行来源连到对应分区和样本，生成复查明细汇总供值班人员核验。
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
+from app.engine import quality_registry
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -140,6 +145,91 @@ class ValidationRunService(BaseModuleService):
             "threshold_pct": threshold_pct,
             "alert_recommendation": "建议触发质量告警" if is_degraded else "质量正常",
             "computed_at": datetime.now().isoformat(),
+        }
+
+    def layered_quality_summary(self, table_name: str) -> dict[str, Any]:
+        """读取分区抽样门禁的分层质量结果并生成质量执行汇总。
+
+        与旧的 ``compute_pass_rate``（只按收到行数算比例）不同：
+          * 坏行率采用各分区按抽样概率计权的加权坏行率；
+          * 明确区分暂算值（覆盖不足/样本迟到）与确认值；
+          * 坏行来源可追溯到分区、批次与样本，并汇总复查明细，
+            供值班人员核验和提交整改。
+        若该表尚未建立抽样计划，回退到旧口径并显式标注。
+        """
+        latest = quality_registry.sampling_quality_service.latest_snapshot(table_name)
+        if latest is None:
+            return {
+                "table": table_name,
+                "source": "legacy",
+                "message": "该表尚无分区抽样计划与分层结果，回退到按收到行数的旧口径",
+                "legacy": self.compute_pass_rate_latest(table_name),
+                "generated_at": datetime.now().isoformat(),
+            }
+
+        review_items = quality_registry.sampling_quality_service.list_reviews(table_name)
+        status_cn = {"PENDING": "待核验", "CONFIRMED": "已确认",
+                     "RECTIFIED": "已整改", "DISMISSED": "已驳回"}
+        review_by_partition: dict[str, dict[str, int]] = {}
+        for item in review_items:
+            bucket = review_by_partition.setdefault(item.partition, {})
+            label = status_cn[item.status.value]
+            bucket[label] = bucket.get(label, 0) + 1
+
+        return {
+            "table": table_name,
+            "source": "partition_sampling",
+            "plan_version": latest.plan_version,
+            "result_kind": latest.status.value,          # PROVISIONAL/CONFIRMED
+            "result_kind_text": "暂算值" if latest.status.value == "PROVISIONAL" else "确认值",
+            "tier": latest.tier.value,
+            "weighted_bad_rate": round(latest.weighted_bad_rate, 6),
+            "naive_bad_rate": round(latest.naive_bad_rate, 6),
+            "table_coverage": round(latest.table_coverage, 6),
+            "received_sample_n": latest.received_sample_n,
+            "bad_sample_n": latest.bad_sample_n,
+            "layered_partitions": [
+                {
+                    "partition": p.partition,
+                    "sampling_rate": p.sampling_rate,
+                    "coverage": round(p.coverage, 6),
+                    "weighted_bad_rate": round(p.weighted_bad_rate, 6),
+                    "tier": p.tier.value,
+                    "status": p.status.value,
+                    "planned_sample_n": p.planned_sample_n,
+                    "received_sample_n": p.received_sample_n,
+                    "bad_sample_n": p.bad_sample_n,
+                    "review_progress": review_by_partition.get(p.partition, {}),
+                }
+                for p in latest.partitions
+            ],
+            "active_diagnostics": [
+                d.to_dict() for d in latest.diagnostics if not d.resolved
+            ],
+            "review_total": len(review_items),
+            "review_pending": sum(
+                1 for i in review_items if i.status.value == "PENDING"
+            ),
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    def compute_pass_rate_latest(self, table_name: str) -> dict[str, Any]:
+        """旧口径兜底：取该表最新一条校验批次按收到行数算通过率。"""
+        batches = self.query_by_table(table_name)
+        if not batches:
+            return {"table": table_name, "message": "无校验批次记录"}
+        latest = sorted(
+            batches, key=lambda b: str(b.get("批次标识", "")), reverse=True
+        )[0]
+        total = int(latest.get("总行数", "0"))
+        passed = int(latest.get("通过行数", "0"))
+        failed = int(latest.get("失败行数", "0"))
+        return {
+            "batch_id": latest.get("批次标识"),
+            "total_rows": total,
+            "passed_rows": passed,
+            "failed_rows": failed,
+            "pass_rate_pct": round(passed / max(total, 1) * 100, 2),
         }
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:

@@ -312,8 +312,22 @@ def analyze_dag(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ---- 综合管线运行报告 ----
+# ---- 质量执行汇总（读取分区抽样分层质量结果） ----
 
+@router.get("/quality/validation-summary/{table_name}")
+def validation_layered_summary(table_name: str) -> dict[str, Any]:
+    """质量执行汇总：读取分层质量结果并附复查明细进度。
+
+    与只按收到行数算坏行比例的旧口径不同，这里返回加权坏行率、
+    覆盖度、暂算/确认状态和按分区归集的复查进度。
+    """
+    from app.services import service_for
+
+    service = service_for("validation_run")
+    return service.layered_quality_summary(table_name)
+
+
+# ---- 综合管线运行报告 ----
 @router.get("/pipelines/{pipeline_id}/run-report")
 def pipeline_run_report(pipeline_id: str) -> dict[str, Any]:
     """获取管线的综合运行报告。"""

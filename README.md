@@ -77,5 +77,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 分区抽样质量门禁
+
+旧门禁只按"实际收到的行"计算坏行比例，无法体现各分区不同的抽样概率和
+样本覆盖范围。`app/engine/partition_sampling.py` 提供两层判定：
+
+- **分层（分区）结果**：每个分区按自己的抽样概率给样本计权
+  （权重 = 1/抽样概率），用计划中明示的 `pass_max / fail_max` 阈值算出
+  加权坏行率和 PASS/WARN/FAIL 结论；覆盖率低于该分区 `min_coverage` 时
+  只给**暂算值（PROVISIONAL）**，不得确认放行。
+- **整表结果**：按分区总体规模加权汇总；所有必需分区覆盖达标且整表加权
+  覆盖率达到 `min_table_coverage` 才输出**确认值（CONFIRMED）**。
+
+关键口径：没收到的样本不按通过算（只进覆盖率诊断）；补报样本携带
+`plan_version`，按其所属版本的抽样率计权；阈值或抽样配置变更生成新计划
+版本，每次重算在快照里另存当时使用的抽样数与坏行数；坏行自动生成复查
+明细并溯源到分区、批次与样本，支持核验/整改/驳回流转。
+
+接口前缀 `/api/sampling-quality`（计划与修订、批次与样本登记、评估与
+快照、复查、报表）；质量执行汇总通过
+`GET /api/business/quality/validation-summary/{table}` 读取分层结果。
+前端导航「抽样质量门禁」提供两步抽样剧本（小分区补报、大分区迟到补齐）。
+场景测试：`cd backend && .venv/bin/python -m unittest discover -s tests -v`。
+
 领域：数据工程
 子方向：数仓与数据湖
